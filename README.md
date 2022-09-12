@@ -148,3 +148,155 @@ These themes repeat throughout:
 
 * Threading makes code hard to reason about.
 * Threading is an inefficient model for large-scale concurrency (thousands of concurrent tasks)
+ 
+# 3. Asyncio Walk-Through
+
+## The Tower of Asyncio
+
+As you saw in the preceding section, there are only a handful of commands that you need to know to be able to use asyncio as an end-user developer. Unfortunately, the documentation for asyncio presents a huge number of APIs, and it does so in a very “flat” format that makes it hard to tell which things are intended for common use and which are facilities being provided to framework designers.
+
+When framework designers look at the same documentation, they look for hook points to which they can connect up their new frameworks or third-party libraries. In this section, we’ll look at asyncio through the eyes of a framework designer to get a sense of how they might approach building a new async-compatible library. Hopefully, this will help to further delineate the features that you need to care about in your own work.
+
+From this perspective, it is much more useful to think about the asyncio module as being arranged in a hierarchy (rather than a flat list), in which each level is built on top of the specification of the previous level. It isn’t quite as neat as that, unfortunately, and I’ve taken liberties with the arrangement in Table 3-1, but hopefully this will give you an alternative view of the asyncio API.
+
+![Table](ScreenshotsForNotes/Chapter3/Table_3_1.PNG)
+
+At the most fundamental level, Tier 1, we have the coroutines that you’ve already seen earlier in this book. This is the lowest level at which one can begin to think about designing a third-party framework, and surprisingly, this turns out to be somewhat popular with not one, but two, async frameworks currently available in the wild: Curio and Trio. Both of these rely only on native coroutines in Python, and nothing whatsoever from the asyncio library module . The next level is the event loop. Coroutines are not useful by themselves: they won’t do anything without a loop on which to run them (therefore, necessarily, Curio and Trio implement their own event loops). asyncio provides both a loop specification, AbstractEventLoop, and an implementation, BaseEventLoop.
+
+The clear separation between specification and implementation makes it possible for third-party developers to make alternative implementations of the event loop, and this has already happened with the uvloop project, which provides a much faster loop implementation than the one in the asyncio standard library module. Importantly, uvloop simply “plugs into” the hierarchy and replaces only the loop part of the stack. The ability to make these kinds of choices is exactly why the asyncio API has been designed like this, with clear separation between the moving parts.
+
+Tiers 3 and 4 bring us futures and tasks, which are very closely related; they’re separated only because Task is a subclass of Future, but they could easily be considered to be in the same tier. A Future instance represents some sort of ongoing action that will return a result via notification on the event loop, while a Task represents a coroutine running on the event loop. The short version is: a future is “loop-aware,” while a task is both “loop-aware” and “coroutine-aware.” As an end-user developer, you will be working with tasks much more than futures, but for a framework designer, the proportion might be the other way around, depending on the details.
+
+Tier 5 represents the facilities for launching, and awaiting on work that must be run in a separate thread, or even in a separate process.
+
+Tier 6 represents additional async-aware tools such as asyncio.Queue. I could have placed this tier after the network tiers, but I think it’s neater to get all of the coroutine-aware APIs out of the way first, before we look at the I/O layers. The Queue provided by asyncio has a very similar API to the thread-safe Queue in the queue module, except that the asyncio version requires the await keyword on get() and put(). You cannot use queue.Queue directly inside coroutines because its get() will block the main thread.
+
+Finally, we have the network I/O tiers, 7 through 9. As an end-user developer, the most convenient API to work with is the streams API at Tier 9. I have positioned the streams API at the highest level of abstraction in the tower. The protocols API, immediately below that (Tier 8), is a more fine-grained API; you can use the protocols tier in all instances where you might use the streams tier, but using streams will be simpler. The final network I/O tier is the transport tier (Tier 7). It is unlikely you will ever have to work with this tier directly, unless you’re creating a framework for others to use and you need to customize how the transports are set up.
+
+In “Quickstart” on page 22, we looked at the absolute bare minimum that one would need to know to get started with the asyncio library. Now that we’ve had a look at how the entire asyncio library API is put together, I’d like to revisit that short list of features and reemphasize which parts you are likely to need to learn.
+
+These are the tiers that are most important to focus on when learning how to use the asyncio library module for writing network applications:
+
+* *Tier 1*
+  * Understanding how to write async def functions and use await to call and execute other coroutines is essential.
+* *Tier 2*
+  * Understanding how to start up, shut down, and interact with the event loop is essential.
+* *Tier 5*
+  * Executors are necessary to use blocking code in your async application, and the reality is that most third-party libraries are not yet asyncio-compatible. A good example of this is the SQLAlchemy database ORM library, for which no featurecomparable alternative is available right now for asyncio.
+* *Tier 6*
+  * If you need to feed data to one or more long-running coroutines, the best way to do that is with asyncio.Queue. This is exactly the same strategy as using queue.Queue for distributing data between threads. The Asyncio version of Queue uses the same API as the standard library queue module, but uses coroutines instead of the blocking methods like get().
+* *Tier 9*
+  * The streams API gives you the simplest way to handle socket communication over a network, and it is here that you should begin prototyping ideas for network applications. You may find that more fine-grained control is needed, and then you could switch to the protocols API, but in most projects it’s usually best to keep things simple until you know exactly what problem you’re trying to solve.
+
+Of course, if you’re using an asyncio-compatible third-party library that handles all the socket communication for you, like aiohttp, you won’t need to directly work with the asyncio network tiers at all. In this case, you must rely heavily on the documentation provided with the library.
+
+The asyncio library tries to provide sufficient features for both end-user developers and framework designers. Unfortunately, this means that the asyncio API can appear somewhat sprawling. I hope that this section has provided enough of a road map to help you pick out the parts you need.
+
+In the next sections, we’re going to look at the component parts of the preceding list in more detail.
+
+## Coroutines
+
+Let’s begin at the very beginning: what is a coroutine?
+
+My goal in this section is to help you understand the specific meaning behind terms like coroutine object and asynchronous function. The examples that follow will show low-level interactions not normally required in most programs; however, the examples will help give you a clearer understanding of the fundamental parts of Asyncio, and will make later sections much easier to grasp.
+
+The following examples can all be reproduced in a Python 3.8 interpreter in interactive mode, and I urge you to work through them on your own by typing them yourself, observing the output, and perhaps experimenting with different ways of interacting with async and await.
+
+## The New ```async def``` Keywords
+
+![Example](ScreenshotsForNotes/Chapter3/Example_3_4.PNG) ![Example](ScreenshotsForNotes/Chapter3/Example_3_5.PNG)
+
+This brings us back to our original question: what exactly is a coroutine? A coroutine is an object that encapsulates the ability to resume an underlying function that has been suspended before completion. If that sounds familiar, it’s because coroutines are very similar to generators. Indeed, before the introduction of native coroutines with the async def and await keywords in Python 3.5, it was already possible to use the asyncio library in Python 3.4 by using normal generators with special decorators.5 It isn’t surprising that the new async def functions (and the coroutines they return) behave in a similar way to generators.
+
+We can play with coroutine objects a bit more to see how Python makes use of them. Most importantly, we want to see how Python is able to “switch” execution between coroutines. Let’s first look at how the return value can be obtained.
+
+When a coroutine returns, what really happens is that a StopIteration exception is raised. Example 3-6, which continues in the same session as the previous examples, makes that clear.
+
+![Example](ScreenshotsForNotes/Chapter3/Example_3_6_1.PNG) ![Example](ScreenshotsForNotes/Chapter3/Example_3_6_2.PNG)
+
+These two points, the send() and the StopIteration, define the start and end of the executing coroutine, respectively. So far this just seems like a really convoluted way to run a function, but that’s OK: the event loop will be responsible for driving coroutines with these low-level internals. From your point of view, you will simply schedule coroutines for execution on the loop, and they will get executed top-down, almost like normal functions.
+
+The next step is to see how the execution of the coroutine can be suspended.
+
+## The New ```await``` Keyword
+
+This new keyword await always takes a parameter and will accept only a thing called an awaitable, which is defined as one of these (exclusively!):
+
+* A coroutine (i.e., the result of a called async def function).6
+
+* Any object implementing the ```__await__()``` special method. That special method must return an iterator.
+
+```Python3
+import asyncio
+
+
+async def f():
+    await asyncio.sleep(1.0)
+    return 123
+
+
+async def main():
+    result = await f()  # Calling f() produces a coroutine; this means we are allowed to await it. The value of the
+    # result variable will be 123 when f() completes
+    return result
+```
+
+![Example](ScreenshotsForNotes/Chapter3/Example_3_8.PNG)
+
+The throw() method is used (internally in asyncio) for task cancellation, which we can also demonstrate quite easily. We’re even going to go ahead in Example 3-9 and handle the cancellation inside a new coroutine.
+
+![Example](ScreenshotsForNotes/Chapter3/Example_3_9_1.PNG) ![Example](ScreenshotsForNotes/Chapter3/Example_3_9_2.PNG)
+
+## Event Loop
+
+The preceding section showed how the send() and throw() methods can interact with a coroutine, but that was just to help you understand how coroutines themselves are structured. The event loop in asyncio handles all of the switching between coroutines, as well as catching those StopIteration exceptions—and much more, such as listening to sockets and file descriptors for events.
+
+You can get by without ever needing to work with the event loop directly: your asyn cio code can be written entirely using await calls, initiated by an asyncio.run(coro) call. However, at times some degree of interaction with the event loop itself might be necessary, and here we’ll discuss how to obtain it.
+
+There are two ways:
+
+* *Recommended*
+  * ```asyncio.get_running_loop()```, callable from inside the context of a coroutine
+* *Discouraged*
+  * ```asyncio.get_event_loop()```, callable from anywhere
+
+You’re going to see the discouraged function in much existing code, because the newer function, get_running_loop(), was introduced much later, in Python 3.8. Thus, it will be useful in practice having a basic idea of how the older method works, so we’ll look at both. Let’s start with Example 3-12.
+
+![Example](ScreenshotsForNotes/Chapter3/Example_3_12.PNG)
+
+This means that if you’re inside a coroutine function and you need access to the loop instance, it’s fine to call get_event_loop() or get_running_loop() to obtain it. You do not need to pass an explicit loop parameter through all your functions.
+
+The situation is different if you’re a framework designer: it would be better to design your functions to accept a loop parameter, just in case your users are doing something unusual with event loop policies. Policies are out of scope for this book, and we’ll say no more about them.
+
+So if get_event_loop() and get_running_loop() work the same, why do they both exist? The get_event_loop() method works only within the same thread. In fact, get_event_loop() will fail if called inside a new thread unless you specifically create a new loop with new_event_loop(), and set that new instance to be the loop for that thread by calling set_event_loop(). Most of us will only ever need (and want!) a single loop instance running in a single thread. This is nearly the entire point of async programming in the first place.
+
+In contrast, get_running_loop() (the recommended method) will always do what you expect: because it can be called only within the context of a coroutine, a task, or a function called from one of those, it always provides the current running event loop, which is almost always what you want.
+
+The introduction of get_running_loop() has also simplified the spawning of background tasks. Consider Example 3-13, a coroutine function inside which additional tasks are created and not awaited.
+
+```Python3
+import asyncio
+
+
+async def f():
+    # Create some tasks!
+    loop = asyncio.get_event_loop()
+    for i in range():
+        loop.create_task(<some other coroutine>)
+```
+
+In this example, the intention is to launch completely new tasks inside the coroutine. By not awaiting them, we ensure they will run independently of the execution context inside coroutine function f(). In fact, f() will exit before the tasks that it launched have completed.
+
+Before Python 3.7, it was necessary to first obtain the loop instance to schedule a task, but with the introduction of get_running_loop() came other asyncio functions that use it, like asyncio.create_task(). From Python 3.7 on, the code to spawn an async task now looks like Example 3-14.
+
+```Python3
+import asyncio
+
+
+async def f():
+    # Create some tasks!
+    for i in range():
+        asyncio.create_task(<some other coro>)
+```
+
+It is also possible to use another low-level function called asyncio.ensure_future() to spawn tasks in the same way as create_task(), and you will likely still see calls to ensure_future() in older asyncio code. I considered avoiding the distraction of discussing ensure_future(), but it is a perfect case study of an asyncio API that was intended only for framework designers, but made the original adoption of asyncio much more difficult to understand for application developers. The difference between asyncio.create_task() and asyncio.ensure_future() is subtle and confusing for many newcomers. We explore these differences in the next section.
